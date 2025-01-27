@@ -60,3 +60,52 @@ double heston_monte_carlo_pricer(
 }
 
 
+
+
+double heston_monte_carlo_pricer(
+    double S0, double K, double T, double r,
+    double kappa, double theta, double sigma, double rho, double v0,
+    int n_paths = 100000, int n_steps = 252) {
+
+    // Add proper seeding using current time plus some offset to ensure different seed from pricer_2
+    unsigned seed = std::chrono::system_clock::now().time_since_epoch().count() + 12345;
+    std::mt19937 gen(seed);  // Seed the Mersenne Twister generator
+    std::normal_distribution<> normal(0.0, 1.0);
+
+    double dt = T / n_steps;
+    double sqrt_dt = std::sqrt(dt);
+
+    // Initialize stock prices and variances
+    std::vector<std::vector<double>> S(n_paths, std::vector<double>(n_steps + 1, S0));
+    std::vector<std::vector<double>> v(n_paths, std::vector<double>(n_steps + 1, v0));
+
+    // Monte Carlo simulation with full truncation scheme
+    for (int t = 0; t < n_steps; t++) {
+        for (int i = 0; i < n_paths; i++) {
+            // Generate two independent standard normal variables
+            double Z1 = normal(gen);
+            double Z2 = rho * Z1 + std::sqrt(1 - rho * rho) * normal(gen);
+
+            // Update variance using full truncation scheme
+            double v_positive = std::max(v[i][t], 0.0);  // Use only positive values for drift and diffusion
+            v[i][t + 1] = v[i][t] + kappa * (theta - v_positive) * dt + 
+                         sigma * std::sqrt(v_positive) * Z1 * sqrt_dt;
+
+            // Update stock price using Euler-Maruyama with log transformation
+            double log_S = std::log(S[i][t]);
+            log_S += (r - 0.5 * v_positive) * dt + std::sqrt(v_positive) * Z2 * sqrt_dt;
+            S[i][t + 1] = std::exp(log_S);
+        }
+    }
+
+    // Compute call option payoffs at maturity
+    std::vector<double> payoffs(n_paths);
+    for (int i = 0; i < n_paths; i++) {
+        payoffs[i] = std::max(S[i][n_steps] - K, 0.0);
+    }
+
+    // Calculate price with control variate technique
+    double mean_payoff = std::accumulate(payoffs.begin(), payoffs.end(), 0.0) / n_paths;
+    return std::exp(-r * T) * mean_payoff;
+}
+

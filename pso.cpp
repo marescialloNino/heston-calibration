@@ -5,8 +5,9 @@
 #include <chrono>
 #include "pso.h"
 #include "heston_fft.h"
+#include "fractional_heston.h"
 
-// Function to compute mean squared error
+
 double compute_mse(double S0, double T, double r, 
                   const double* strikes, const double* market_prices, int n_options,
                   double v0, double kappa, double theta, double sigma, double rho, double lambda) {
@@ -20,7 +21,8 @@ double compute_mse(double S0, double T, double r,
             theta,  // theta (long-term variance)
             sigma,  // sigma (vol of vol)
             rho,    // rho (correlation)
-            lambda  // lambda (risk premium)
+            lambda , // lambda (risk premium)
+            800
         );
         double error = model_price - market_prices[i];
         mse += error * error;
@@ -31,19 +33,22 @@ double compute_mse(double S0, double T, double r,
 
 void particle_swarm_optimization(double S0, double T, double r,
                                const double* strikes, const double* market_prices, int n_options,
-                               double* optimal_params) {
-    int n_particles = 300;     // Number of particles
-    int n_iterations = 1000;     // Number of iterations
-    const double MAX_VELOCITY = 1.6;  // Add constant max velocity
-    
-    // Parameter bounds in the same order as heston_price:
+                               double* optimal_params,
+                               bool use_fractional) {
+    int n_particles = 10;     // Number of particles
+    int n_iterations = 10;     // Number of iterations
+    const double MAX_VELOCITY = 1.8;  // Add constant max velocity
+    const int DISCOVERY_MODE_THRESHOLD = 40; // Threshold for discovery mode
+    const int SUPER_DISCOVERY_MODE_THRESHOLD = 3; // Threshold for super discovery mode
+
+    // Fix the bounds initialization
     double bounds[6][2] = {
         {0.01, 3.0},    // [0] v0: initial variance
-        {0.0, 5.0},    // [1] kappa: mean reversion
-        {0.0, 5.0},   // [2] theta: long-term variance
-        {0.0, 5.0},    // [3] sigma: vol of vol
-        {-1.0 , 1.0},  // [4] rho: correlation
-        {0.0, 5.0}     // [5] lambda: risk premium
+        {0.0, 5.0},     // [1] kappa: mean reversion
+        {0.0, 5.0},     // [2] theta: long-term variance
+        {0.0, 5.0},     // [3] sigma: vol of vol
+        {-1.0, 1.0},    // [4] rho: correlation
+        {0.0, use_fractional ? 1.0 : 5.0}  // [5] H or lambda
     };
 
     // Initialize particles and velocities
@@ -75,23 +80,38 @@ void particle_swarm_optimization(double S0, double T, double r,
     double w_start = 1.0;     // Initial inertia weight
     double w_end = 0.8;       // Final inertia weight
 
+    int no_improvement_count = 0; // Counter for iterations without improvement
+    int discovery_mode_count = 0; // Counter for discovery mode activations
+    double best_cost = DBL_MAX; // Track the best cost found
+
     // Main PSO loop
     for (int iter = 0; iter < n_iterations; iter++) {
         auto iter_start = std::chrono::high_resolution_clock::now();
         
         // Adaptive inertia weight
         double w = w_start - (w_start - w_end) * iter / n_iterations;
-        double cognitive_component = 1.7;
-        double social_component = 1.3;
+        double cognitive_component = 2.0;
+        double social_component = 1.0;
         // Update particles
         for (int i = 0; i < n_particles; i++) {
-            double cost = compute_mse(S0, T, r, strikes, market_prices, n_options,
-                                    particles[i][0],  // v0
-                                    particles[i][1],  // kappa
-                                    particles[i][2],  // theta
-                                    particles[i][3],  // sigma
-                                    particles[i][4],  // rho
-                                    particles[i][5]); // lambda
+            double cost;
+            if (use_fractional) {
+                cost = compute_fractional_mse(S0, T, r, strikes, market_prices, n_options,
+                                            particles[i][0],  // v0
+                                            particles[i][1],  // kappa
+                                            particles[i][2],  // theta
+                                            particles[i][3],  // sigma
+                                            particles[i][4],  // rho
+                                            particles[i][5]); // H
+            } else {
+                cost = compute_mse(S0, T, r, strikes, market_prices, n_options,
+                                 particles[i][0],  // v0
+                                 particles[i][1],  // kappa
+                                 particles[i][2],  // theta
+                                 particles[i][3],  // sigma
+                                 particles[i][4],  // rho
+                                 particles[i][5]); // lambda
+            }
 
             if (cost < personal_best_cost[i]) {
                 personal_best_cost[i] = cost;
@@ -123,6 +143,43 @@ void particle_swarm_optimization(double S0, double T, double r,
                 particles[i][j] += velocities[i][j];
                 particles[i][j] = fmax(bounds[j][0], fmin(bounds[j][1], particles[i][j]));
             }
+        }
+
+        // Check for improvement
+        if (global_best_cost < best_cost) {
+            best_cost = global_best_cost;
+            no_improvement_count = 0; // Reset counter on improvement
+        } else {
+            no_improvement_count++;
+        }
+
+        // Discovery mode: shake particles if no improvement for a threshold
+        if (no_improvement_count >= DISCOVERY_MODE_THRESHOLD) {
+            printf("Entering discovery mode: shaking particles around the parameter space.\n"); // Print message
+            for (int i = 0; i < n_particles; i++) {
+                for (int j = 0; j < 6; j++) {
+                    // Shake particles around the parameter space
+                    double mid = (bounds[j][0] + bounds[j][1]) / 2.0;
+                    double range = bounds[j][1] - bounds[j][0];
+                    particles[i][j] = mid + ((double)rand() / RAND_MAX - 0.5) * range;
+                }
+            }
+            no_improvement_count = 0; // Reset counter after shaking
+            discovery_mode_count++; // Increment discovery mode counter
+        }
+
+        // Super discovery mode: more aggressive shaking if discovery mode has been triggered multiple times
+        if (discovery_mode_count >= SUPER_DISCOVERY_MODE_THRESHOLD) {
+            printf("Entering super discovery mode: aggressive shaking of particles.\n"); // Print message
+            for (int i = 0; i < n_particles; i++) {
+                for (int j = 0; j < 6; j++) {
+                    // Aggressive shaking: larger range
+                    double mid = (bounds[j][0] + bounds[j][1]) / 2.0;
+                    double range = (bounds[j][1] - bounds[j][0]) * 2.0; // Double the range for aggressive shaking
+                    particles[i][j] = mid + ((double)rand() / RAND_MAX - 0.5) * range;
+                }
+            }
+            discovery_mode_count = 0; // Reset counter after super discovery mode
         }
 
         auto iter_end = std::chrono::high_resolution_clock::now();
